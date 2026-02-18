@@ -356,14 +356,40 @@ See [`deploy/deploy.schema.yaml`](deploy/deploy.schema.yaml) for full configurat
 
 ## Getting Started
 
-### After Forking
+### Creating Your Project
 
-When you fork this repository, GitHub gives you the option to fork only the `main` branch. If you chose that option (or want to ensure all required branches exist), run the setup script:
+> **Warning**: Do NOT use GitHub's "Fork" button. Forks maintain a link to this repository, and PRs will accidentally target the original repo instead of your own.
+
+**Option 1: Use as Template (Recommended)**
+
+1. Click the green **"Use this template"** button at the top of this repo
+2. Select **"Create a new repository"**
+3. Choose your organization/account and name your project
+4. Clone your new repo and run the setup script
+
+**Option 2: Manual Clone**
 
 ```bash
-# Clone your fork
-git clone https://github.com/YOUR_USERNAME/k8s-project-starter.git
-cd k8s-project-starter
+# Clone the starter
+git clone https://github.com/ORIGINAL/k8s-project-starter.git my-project
+cd my-project
+
+# Remove the link to the original repo
+git remote remove origin
+
+# Create a new repo on GitHub, then:
+git remote add origin git@github.com:YOUR_ORG/my-project.git
+git push -u origin main
+```
+
+### After Creating Your Project
+
+Once you have your own independent copy, run the setup script to create the required branches:
+
+```bash
+# Clone your new repo
+git clone https://github.com/YOUR_ORG/my-project.git
+cd my-project
 
 # Run the setup script to create required branches
 ./scripts/setup-repo.sh

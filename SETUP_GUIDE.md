@@ -1,5 +1,7 @@
 # Setup Guide
 
+> **Important**: Make sure you used "Use this template" or manually cloned the repo (see README). Do NOT use GitHub's "Fork" button—forks maintain a link to the original repo and your PRs will accidentally be sent there.
+
 After running `./scripts/setup-repo.sh`, follow these steps to complete your repository setup.
 
 ---
