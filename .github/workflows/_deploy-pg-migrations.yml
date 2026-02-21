@@ -1,0 +1,309 @@
+name: Deploy PostgreSQL Migrations
+
+on:
+  workflow_call:
+    inputs:
+      service:
+        required: true
+        type: string
+        description: 'Service name (used for database targeting)'
+      service-path:
+        required: true
+        type: string
+        description: 'Path to service (e.g., services/tokens)'
+      environment:
+        required: true
+        type: string
+        description: 'Target environment (dev, staging, prod)'
+      migrations-path:
+        required: false
+        type: string
+        default: ''
+        description: 'Path to migrations (defaults to {service-path}/migrations)'
+    secrets:
+      KUBECONFIG:
+        required: true
+        description: 'Base64 encoded kubeconfig'
+    outputs:
+      applied_count:
+        description: 'Number of migrations applied'
+        value: ${{ jobs.migrate.outputs.applied_count }}
+      status:
+        description: 'Migration status (success, skipped, failed)'
+        value: ${{ jobs.migrate.outputs.status }}
+
+jobs:
+  migrate:
+    runs-on: ubuntu-latest
+    environment: ${{ inputs.environment == 'prod' && 'production' || inputs.environment == 'staging' && 'staging' || 'development' }}
+    outputs:
+      applied_count: ${{ steps.run-migrations.outputs.applied_count }}
+      status: ${{ steps.run-migrations.outputs.status }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup kubectl
+        uses: azure/setup-kubectl@v3
+        with:
+          version: 'v1.28.0'
+
+      - name: Configure kubectl
+        run: |
+          mkdir -p ~/.kube
+          echo "${{ secrets.KUBECONFIG }}" | base64 -d > ~/.kube/config
+          chmod 600 ~/.kube/config
+
+      - name: Determine migrations path
+        id: paths
+        run: |
+          if [[ -n "${{ inputs.migrations-path }}" ]]; then
+            MIGRATIONS_PATH="${{ inputs.migrations-path }}"
+          else
+            MIGRATIONS_PATH="${{ inputs.service-path }}/migrations"
+          fi
+          echo "migrations_path=$MIGRATIONS_PATH" >> $GITHUB_OUTPUT
+
+          # Derive namespace and database from service path
+          OVERLAY_PATH="${{ inputs.service-path }}/k8s/overlays/${{ inputs.environment }}"
+          if [[ -f "$OVERLAY_PATH/kustomization.yaml" ]]; then
+            NAMESPACE=$(grep -E "^namespace:" "$OVERLAY_PATH/kustomization.yaml" | awk '{print $2}' | tr -d '"'"'" || echo "${{ inputs.environment }}")
+            if [[ -z "$NAMESPACE" ]]; then
+              NAMESPACE="${{ inputs.environment }}"
+            fi
+          else
+            NAMESPACE="${{ inputs.environment }}"
+          fi
+          echo "namespace=$NAMESPACE" >> $GITHUB_OUTPUT
+
+          # Database service name (convention: {service}-postgres)
+          DB_SERVICE="${{ inputs.service }}-postgres"
+          echo "db_service=$DB_SERVICE" >> $GITHUB_OUTPUT
+
+      - name: Check for migrations
+        id: check
+        run: |
+          MIGRATIONS_PATH="${{ steps.paths.outputs.migrations_path }}"
+
+          if [[ ! -d "$MIGRATIONS_PATH" ]]; then
+            echo "has_migrations=false" >> $GITHUB_OUTPUT
+            echo "No migrations directory found at $MIGRATIONS_PATH"
+            exit 0
+          fi
+
+          # Count migration files (V*.sql pattern)
+          MIGRATION_COUNT=$(find "$MIGRATIONS_PATH" -maxdepth 1 -name "*.sql" -type f | wc -l)
+
+          if [[ "$MIGRATION_COUNT" -eq 0 ]]; then
+            echo "has_migrations=false" >> $GITHUB_OUTPUT
+            echo "No migration files found in $MIGRATIONS_PATH"
+          else
+            echo "has_migrations=true" >> $GITHUB_OUTPUT
+            echo "migration_count=$MIGRATION_COUNT" >> $GITHUB_OUTPUT
+            echo "Found $MIGRATION_COUNT migration files"
+
+            # List migrations
+            echo "### Migration Files" >> $GITHUB_STEP_SUMMARY
+            find "$MIGRATIONS_PATH" -maxdepth 1 -name "*.sql" -type f | sort >> $GITHUB_STEP_SUMMARY
+          fi
+
+      - name: Create migration ConfigMap
+        if: steps.check.outputs.has_migrations == 'true'
+        run: |
+          MIGRATIONS_PATH="${{ steps.paths.outputs.migrations_path }}"
+          NAMESPACE="${{ steps.paths.outputs.namespace }}"
+          SERVICE="${{ inputs.service }}"
+
+          # Create ConfigMap from migration files
+          kubectl create configmap "${SERVICE}-migrations" \
+            --from-file="$MIGRATIONS_PATH" \
+            --namespace="$NAMESPACE" \
+            --dry-run=client -o yaml | kubectl apply -f -
+
+          echo "Created ConfigMap ${SERVICE}-migrations in namespace $NAMESPACE"
+
+      - name: Get database credentials
+        if: steps.check.outputs.has_migrations == 'true'
+        id: db-creds
+        run: |
+          NAMESPACE="${{ steps.paths.outputs.namespace }}"
+          SERVICE="${{ inputs.service }}"
+
+          # Get credentials from secret (convention: {service}-secrets)
+          DB_PASSWORD=$(kubectl get secret "${SERVICE}-secrets" -n "$NAMESPACE" \
+            -o jsonpath='{.data.DB_PASSWORD}' 2>/dev/null | base64 -d || echo "")
+
+          if [[ -z "$DB_PASSWORD" ]]; then
+            echo "::warning::Could not find DB_PASSWORD in ${SERVICE}-secrets"
+          fi
+
+          echo "::add-mask::$DB_PASSWORD"
+          echo "db_password=$DB_PASSWORD" >> $GITHUB_OUTPUT
+
+      - name: Run migrations
+        id: run-migrations
+        if: steps.check.outputs.has_migrations == 'true'
+        run: |
+          NAMESPACE="${{ steps.paths.outputs.namespace }}"
+          SERVICE="${{ inputs.service }}"
+          DB_SERVICE="${{ steps.paths.outputs.db_service }}"
+          DB_PASSWORD="${{ steps.db-creds.outputs.db_password }}"
+
+          # Create the migration runner Job
+          cat <<EOF | kubectl apply -f -
+          apiVersion: batch/v1
+          kind: Job
+          metadata:
+            name: ${SERVICE}-migrate-$(date +%s)
+            namespace: $NAMESPACE
+            labels:
+              app: ${SERVICE}-migrate
+          spec:
+            ttlSecondsAfterFinished: 300
+            backoffLimit: 0
+            template:
+              spec:
+                restartPolicy: Never
+                containers:
+                  - name: migrate
+                    image: postgres:16-alpine
+                    env:
+                      - name: PGHOST
+                        value: "$DB_SERVICE"
+                      - name: PGPORT
+                        value: "5432"
+                      - name: PGDATABASE
+                        value: "$SERVICE"
+                      - name: PGUSER
+                        value: "$SERVICE"
+                      - name: PGPASSWORD
+                        value: "$DB_PASSWORD"
+                    volumeMounts:
+                      - name: migrations
+                        mountPath: /migrations
+                        readOnly: true
+                    command:
+                      - /bin/sh
+                      - -c
+                      - |
+                        set -e
+
+                        echo "=== PostgreSQL Migration Runner ==="
+                        echo "Database: \$PGDATABASE@\$PGHOST:\$PGPORT"
+
+                        # Wait for database to be ready
+                        echo "Waiting for database..."
+                        until pg_isready -h \$PGHOST -p \$PGPORT -U \$PGUSER; do
+                          sleep 2
+                        done
+                        echo "Database is ready"
+
+                        # Create schema_migrations table if not exists
+                        psql -c "
+                          CREATE TABLE IF NOT EXISTS schema_migrations (
+                            version VARCHAR(255) PRIMARY KEY,
+                            applied_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+                          );
+                        "
+
+                        # Get already applied migrations
+                        APPLIED=\$(psql -t -A -c "SELECT version FROM schema_migrations ORDER BY version;")
+                        echo "Applied migrations: \$APPLIED"
+
+                        # Run pending migrations in order
+                        APPLIED_COUNT=0
+                        for migration in \$(ls /migrations/*.sql 2>/dev/null | sort); do
+                          filename=\$(basename "\$migration")
+                          version="\${filename%.sql}"
+
+                          # Check if already applied
+                          if echo "\$APPLIED" | grep -q "^\$version\$"; then
+                            echo "SKIP: \$version (already applied)"
+                            continue
+                          fi
+
+                          echo "APPLYING: \$version"
+
+                          # Run migration in a transaction
+                          psql -v ON_ERROR_STOP=1 -f "\$migration"
+
+                          # Record migration
+                          psql -c "INSERT INTO schema_migrations (version) VALUES ('\$version');"
+
+                          echo "DONE: \$version"
+                          APPLIED_COUNT=\$((APPLIED_COUNT + 1))
+                        done
+
+                        echo ""
+                        echo "=== Migration Complete ==="
+                        echo "Applied \$APPLIED_COUNT new migration(s)"
+
+                        # Show current state
+                        echo ""
+                        echo "Current schema_migrations:"
+                        psql -c "SELECT * FROM schema_migrations ORDER BY version;"
+                volumes:
+                  - name: migrations
+                    configMap:
+                      name: ${SERVICE}-migrations
+          EOF
+
+          # Get the job name
+          JOB_NAME=$(kubectl get jobs -n "$NAMESPACE" -l app=${SERVICE}-migrate \
+            --sort-by=.metadata.creationTimestamp -o jsonpath='{.items[-1].metadata.name}')
+
+          echo "Waiting for migration job: $JOB_NAME"
+
+          # Wait for completion with timeout
+          if kubectl wait --for=condition=complete job/"$JOB_NAME" -n "$NAMESPACE" --timeout=300s 2>/dev/null; then
+            echo "status=success" >> $GITHUB_OUTPUT
+
+            # Get logs
+            POD_NAME=$(kubectl get pods -n "$NAMESPACE" -l job-name="$JOB_NAME" -o jsonpath='{.items[0].metadata.name}')
+            echo "### Migration Output" >> $GITHUB_STEP_SUMMARY
+            echo '```' >> $GITHUB_STEP_SUMMARY
+            kubectl logs "$POD_NAME" -n "$NAMESPACE" >> $GITHUB_STEP_SUMMARY
+            echo '```' >> $GITHUB_STEP_SUMMARY
+
+            # Extract applied count from logs
+            APPLIED_COUNT=$(kubectl logs "$POD_NAME" -n "$NAMESPACE" | grep "Applied .* new migration" | grep -oE '[0-9]+' || echo "0")
+            echo "applied_count=$APPLIED_COUNT" >> $GITHUB_OUTPUT
+
+          elif kubectl wait --for=condition=failed job/"$JOB_NAME" -n "$NAMESPACE" --timeout=10s 2>/dev/null; then
+            echo "status=failed" >> $GITHUB_OUTPUT
+            echo "applied_count=0" >> $GITHUB_OUTPUT
+
+            # Get failure logs
+            POD_NAME=$(kubectl get pods -n "$NAMESPACE" -l job-name="$JOB_NAME" -o jsonpath='{.items[0].metadata.name}')
+            echo "### Migration Failed" >> $GITHUB_STEP_SUMMARY
+            echo '```' >> $GITHUB_STEP_SUMMARY
+            kubectl logs "$POD_NAME" -n "$NAMESPACE" >> $GITHUB_STEP_SUMMARY 2>&1 || true
+            echo '```' >> $GITHUB_STEP_SUMMARY
+
+            echo "::error::Migration job failed"
+            exit 1
+          else
+            echo "status=timeout" >> $GITHUB_OUTPUT
+            echo "applied_count=0" >> $GITHUB_OUTPUT
+            echo "::error::Migration job timed out"
+            exit 1
+          fi
+
+      - name: Skip message
+        if: steps.check.outputs.has_migrations == 'false'
+        run: |
+          echo "status=skipped" >> $GITHUB_OUTPUT
+          echo "applied_count=0" >> $GITHUB_OUTPUT
+          echo "### Migrations" >> $GITHUB_STEP_SUMMARY
+          echo "No migration files found - skipping" >> $GITHUB_STEP_SUMMARY
+
+      - name: Cleanup
+        if: always()
+        run: |
+          NAMESPACE="${{ steps.paths.outputs.namespace }}"
+          SERVICE="${{ inputs.service }}"
+
+          # Clean up old migration jobs (keep last 3)
+          kubectl delete jobs -n "$NAMESPACE" -l app=${SERVICE}-migrate \
+            --field-selector status.successful=1 2>/dev/null || true

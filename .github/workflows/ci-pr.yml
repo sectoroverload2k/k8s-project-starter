@@ -74,7 +74,8 @@ jobs:
       build-type: ${{ matrix.build_type }}
       build-output: ${{ matrix.build_output || '' }}
       version-suffix: ${{ needs.determine-version-suffix.outputs.suffix }}
-      push: ${{ matrix.deploy_type == 'kubernetes' }}
+      push: ${{ matrix.deploy_type == 'kubernetes' && matrix.needs_build }}
+      skip-build: ${{ !matrix.needs_build }}
     secrets: inherit
 
   validate-platform:

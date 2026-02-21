@@ -8,16 +8,17 @@ A Kubernetes monorepo with GitHub Actions CI/CD, supporting multiple services wi
 k8s-project-starter/
 ├── .github/
 │   ├── workflows/
-│   │   ├── ci-pr.yml              # Build on PR (all branches)
-│   │   ├── cd-develop.yml         # Auto-deploy to dev
-│   │   ├── cd-staging.yml         # Auto-deploy to staging
-│   │   ├── cd-production.yml      # Deploy to prod (manual approval)
-│   │   ├── _build-service.yml     # Reusable: build services
-│   │   ├── _deploy-service.yml    # Reusable: Kubernetes deploy
-│   │   ├── _deploy-server.yml     # Reusable: SSH/rsync deploy
-│   │   └── _deploy-migrations.yml # Reusable: Flyway migrations
+│   │   ├── ci-pr.yml               # Build on PR (all branches)
+│   │   ├── cd-develop.yml          # Auto-deploy to dev
+│   │   ├── cd-staging.yml          # Auto-deploy to staging
+│   │   ├── cd-production.yml       # Deploy to prod (manual approval)
+│   │   ├── _build-service.yml      # Reusable: build services
+│   │   ├── _deploy-service.yml     # Reusable: Kubernetes deploy
+│   │   ├── _deploy-server.yml      # Reusable: SSH/rsync deploy
+│   │   ├── _deploy-migrations.yml  # Reusable: Flyway migrations
+│   │   └── _deploy-pg-migrations.yml # Reusable: PostgreSQL migrations
 │   └── actions/
-│       └── detect-changes/        # Path-based change detection
+│       └── detect-changes/         # Dynamic change detection
 │
 ├── apps/                          # User-facing applications
 │   └── <app-name>/
@@ -203,12 +204,27 @@ PR Merged to develop
 
 ### Change Detection
 
-Only services with changes are built and deployed. Changes are detected by path:
+Only services with changes are built and deployed. Change detection is **automatic** — no hardcoded paths required. The pipeline:
 
-- `apps/dashboard/**` → builds `dashboard`
-- `services/api/**` → builds `api`
+1. Uses `git diff` to find changed files
+2. Extracts unique component directories (`apps/<name>`, `services/<name>`, `infra/<name>`)
+3. Reads each component's `deploy.yaml` for deployment configuration
+
+**Shared changes trigger ALL services:**
 - `infra/shared/**` → rebuilds ALL services
 - `.github/workflows/_*.yml` → rebuilds ALL services
+- `platform/platform.yaml` → rebuilds ALL services
+
+### Smart Rebuilds
+
+The pipeline distinguishes between code and config changes:
+
+| Change Type | Build | Deploy |
+|-------------|-------|--------|
+| Code changed (`src/`, `Dockerfile`, etc.) | Full rebuild | New image |
+| Config only (`k8s/` directory) | Skipped | Reuse existing image |
+
+This enables fast config-only deployments (HPA tuning, resource limits, replica counts) without rebuilding images.
 
 ## Parallel Development
 
@@ -364,6 +380,37 @@ targets:
     type: migration
 ```
 
+### Per-Environment Targeting
+
+Services don't have to deploy to all environments. If a target is not defined, the service is skipped:
+
+```yaml
+# services/staging-only/deploy.yaml - Only deploy to staging (for testing)
+build:
+  type: docker
+
+targets:
+  staging:
+    type: kubernetes
+    namespace: staging
+```
+
+```yaml
+# apps/internal-tools/deploy.yaml - Skip development, deploy to staging+prod
+build:
+  type: npm
+
+targets:
+  staging:
+    type: server
+    hosts:
+      - internal.staging.example.com
+  prod:
+    type: server
+    hosts:
+      - internal.example.com
+```
+
 ### Build Types
 
 | Build Type | Description | Output |
@@ -374,6 +421,34 @@ targets:
 | `hugo` | Build Hugo static site | `public/` directory |
 | `zip` | Create zip archive of source | `.zip` file |
 | `none` | No build step needed | Source files |
+
+### Build Context for Shared Packages
+
+For monorepos with shared packages, set `build.context` to reference the repo root:
+
+```yaml
+# services/api/deploy.yaml
+build:
+  type: docker
+  context: .  # Build context is repo root, Dockerfile still in services/api/
+```
+
+This allows your Dockerfile to copy shared directories:
+
+```dockerfile
+# services/api/Dockerfile
+FROM node:20-alpine
+WORKDIR /app
+
+# Copy shared packages first
+COPY packages/shared ./packages/shared
+
+# Copy service code
+COPY services/api ./services/api
+
+WORKDIR /app/services/api
+RUN npm ci && npm run build
+```
 
 ### Namespace Configuration
 
@@ -528,15 +603,44 @@ PROD_DATABASE_PASSWORD
 
 ## Database Migrations
 
-Using Flyway Community Edition for forward migrations against managed databases (RDS, Cloud SQL, etc.).
+The pipeline supports two migration approaches depending on your database.
 
-### Creating Migrations
+### PostgreSQL Migrations (Native Runner)
+
+For PostgreSQL, enable migrations in your `deploy.yaml`:
+
+```yaml
+# services/my-service/deploy.yaml
+database:
+  type: postgresql
+  migrations: true
+
+targets:
+  dev:
+    type: kubernetes
+```
+
+Create migration files:
 
 ```bash
-# Create migrations directory for your service
 mkdir -p services/my-service/migrations
+touch services/my-service/migrations/001_create_users.sql
+touch services/my-service/migrations/002_add_email_index.sql
+```
 
-# Add migration file
+Migrations run automatically before deployment:
+- Uses `schema_migrations` tracking table
+- Runs as Kubernetes Job with `postgres:16-alpine`
+- Each migration runs in a transaction
+- Expects credentials in `{service}-secrets` Secret (`DB_PASSWORD` key)
+- Database service naming convention: `{service}-postgres`
+
+### MySQL/Flyway Migrations
+
+For MySQL or managed databases (RDS, Cloud SQL), use Flyway:
+
+```bash
+mkdir -p services/my-service/migrations
 touch services/my-service/migrations/V001__initial_schema.sql
 ```
 
@@ -545,16 +649,14 @@ Naming: `V{NNN}__{description}.sql`
 - Double underscore separator
 - Description with underscores
 
+Set `type: migration` in your `deploy.yaml` and configure database secrets per environment.
+
 ### Execution
 
 Migrations run automatically via the `_deploy-migrations.yml` workflow:
 1. Flyway runs in a Docker container
 2. Connects directly to your managed database via JDBC
 3. Applies pending migrations before application deployment
-
-### Configuration
-
-Set `type: migration` in your `deploy.yaml` and configure database secrets per environment.
 
 ## Scripts
 

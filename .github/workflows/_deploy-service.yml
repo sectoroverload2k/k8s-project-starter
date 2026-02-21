@@ -16,9 +16,15 @@ on:
         type: string
         description: 'Target environment (dev, staging, prod)'
       image-tag:
-        required: true
+        required: false
         type: string
-        description: 'Full image tag to deploy'
+        default: ''
+        description: 'Image tag to deploy (ignored if keep-existing-image is true)'
+      keep-existing-image:
+        required: false
+        type: boolean
+        default: false
+        description: 'Keep the currently running image instead of updating it'
       registry:
         required: false
         type: string
@@ -28,7 +34,12 @@ on:
         required: false
         type: boolean
         default: false
-        description: 'Run database migrations before deploy'
+        description: 'Run MySQL/Flyway database migrations before deploy'
+      run-pg-migrations:
+        required: false
+        type: boolean
+        default: false
+        description: 'Run PostgreSQL migrations before deploy (service-level)'
       runner:
         required: false
         type: string
@@ -92,6 +103,51 @@ jobs:
           echo "namespace=$NAMESPACE" >> $GITHUB_OUTPUT
           echo "Using namespace: $NAMESPACE"
 
+      - name: Determine image tag
+        id: image-tag
+        run: |
+          SERVICE_PATH="${{ inputs.service-path }}"
+
+          if [[ "${{ inputs.keep-existing-image }}" == "true" ]]; then
+            # Get the current image from the running deployment
+            NAMESPACE="${{ steps.namespace.outputs.namespace }}"
+            DEPLOYMENT="${{ inputs.service }}"
+
+            CURRENT_IMAGE=$(kubectl get deployment "$DEPLOYMENT" -n "$NAMESPACE" \
+              -o jsonpath='{.spec.template.spec.containers[0].image}' 2>/dev/null || echo "")
+
+            if [[ -z "$CURRENT_IMAGE" ]]; then
+              echo "::error::No existing deployment found for ${DEPLOYMENT} in namespace ${NAMESPACE}. Cannot use keep-existing-image for initial deployments."
+              exit 1
+            fi
+
+            # Extract just the tag from the full image reference
+            IMAGE_TAG="${CURRENT_IMAGE##*:}"
+            echo "tag=${IMAGE_TAG}" >> $GITHUB_OUTPUT
+            echo "Keeping existing image tag: ${IMAGE_TAG}" >> $GITHUB_STEP_SUMMARY
+          else
+            # Read version from VERSION file or package.json
+            if [[ -f "${SERVICE_PATH}/VERSION" ]]; then
+              BASE_VERSION=$(cat "${SERVICE_PATH}/VERSION" | tr -d '[:space:]')
+            elif [[ -f "${SERVICE_PATH}/package.json" ]]; then
+              BASE_VERSION=$(jq -r '.version' "${SERVICE_PATH}/package.json")
+            else
+              BASE_VERSION="1.0.0"
+            fi
+
+            # Apply the same version suffix as the build (beta.N, rc.N, etc.)
+            # Extract suffix from the provided image-tag input
+            if [[ "${{ inputs.image-tag }}" =~ -(.+)$ ]]; then
+              VERSION_SUFFIX="${BASH_REMATCH[1]}"
+              IMAGE_TAG="${BASE_VERSION}-${VERSION_SUFFIX}"
+            else
+              IMAGE_TAG="${BASE_VERSION}"
+            fi
+
+            echo "tag=${IMAGE_TAG}" >> $GITHUB_OUTPUT
+            echo "Deploying image tag: ${IMAGE_TAG}" >> $GITHUB_STEP_SUMMARY
+          fi
+
       - name: Run database migrations
         if: inputs.run-migrations
         run: |
@@ -122,6 +178,132 @@ jobs:
             echo "- No migrations found, skipping" >> $GITHUB_STEP_SUMMARY
           fi
 
+      - name: Run PostgreSQL migrations
+        if: inputs.run-pg-migrations
+        run: |
+          echo "### Running PostgreSQL Migrations" >> $GITHUB_STEP_SUMMARY
+
+          SERVICE="${{ inputs.service }}"
+          SERVICE_PATH="${{ inputs.service-path }}"
+          NAMESPACE="${{ steps.namespace.outputs.namespace }}"
+          MIGRATIONS_PATH="${SERVICE_PATH}/migrations"
+
+          if [[ ! -d "$MIGRATIONS_PATH" ]]; then
+            echo "- No migrations directory found at $MIGRATIONS_PATH" >> $GITHUB_STEP_SUMMARY
+            exit 0
+          fi
+
+          # Count migration files
+          MIGRATION_COUNT=$(find "$MIGRATIONS_PATH" -maxdepth 1 -name "*.sql" -type f | wc -l)
+          if [[ "$MIGRATION_COUNT" -eq 0 ]]; then
+            echo "- No migration files found" >> $GITHUB_STEP_SUMMARY
+            exit 0
+          fi
+
+          echo "Found $MIGRATION_COUNT migration files"
+
+          # Create ConfigMap from migration files
+          kubectl create configmap "${SERVICE}-migrations" \
+            --from-file="$MIGRATIONS_PATH" \
+            --namespace="$NAMESPACE" \
+            --dry-run=client -o yaml | kubectl apply -f -
+
+          # Get database password from secret
+          DB_PASSWORD=$(kubectl get secret "${SERVICE}-secrets" -n "$NAMESPACE" \
+            -o jsonpath='{.data.DB_PASSWORD}' 2>/dev/null | base64 -d || echo "")
+
+          # Database service name (convention: {service}-postgres)
+          DB_SERVICE="${SERVICE}-postgres"
+
+          # Create and run the migration job
+          JOB_NAME="${SERVICE}-migrate-$(date +%s)"
+
+          cat <<EOF | kubectl apply -f -
+          apiVersion: batch/v1
+          kind: Job
+          metadata:
+            name: $JOB_NAME
+            namespace: $NAMESPACE
+            labels:
+              app: ${SERVICE}-migrate
+          spec:
+            ttlSecondsAfterFinished: 300
+            backoffLimit: 0
+            template:
+              spec:
+                restartPolicy: Never
+                containers:
+                  - name: migrate
+                    image: postgres:16-alpine
+                    env:
+                      - name: PGHOST
+                        value: "$DB_SERVICE"
+                      - name: PGPORT
+                        value: "5432"
+                      - name: PGDATABASE
+                        value: "$SERVICE"
+                      - name: PGUSER
+                        value: "$SERVICE"
+                      - name: PGPASSWORD
+                        value: "$DB_PASSWORD"
+                    volumeMounts:
+                      - name: migrations
+                        mountPath: /migrations
+                        readOnly: true
+                    command:
+                      - /bin/sh
+                      - -c
+                      - |
+                        set -e
+                        echo "=== PostgreSQL Migration Runner ==="
+
+                        # Wait for database
+                        until pg_isready -h \$PGHOST -p \$PGPORT -U \$PGUSER; do sleep 2; done
+
+                        # Create tracking table
+                        psql -c "CREATE TABLE IF NOT EXISTS schema_migrations (version VARCHAR(255) PRIMARY KEY, applied_at TIMESTAMPTZ DEFAULT NOW());"
+
+                        # Get applied migrations
+                        APPLIED=\$(psql -t -A -c "SELECT version FROM schema_migrations ORDER BY version;")
+
+                        # Run pending migrations
+                        APPLIED_COUNT=0
+                        for migration in \$(ls /migrations/*.sql 2>/dev/null | sort); do
+                          filename=\$(basename "\$migration")
+                          version="\${filename%.sql}"
+                          if echo "\$APPLIED" | grep -q "^\$version\$"; then
+                            echo "SKIP: \$version"
+                            continue
+                          fi
+                          echo "APPLYING: \$version"
+                          psql -v ON_ERROR_STOP=1 -f "\$migration"
+                          psql -c "INSERT INTO schema_migrations (version) VALUES ('\$version');"
+                          APPLIED_COUNT=\$((APPLIED_COUNT + 1))
+                        done
+
+                        echo "Applied \$APPLIED_COUNT new migration(s)"
+                volumes:
+                  - name: migrations
+                    configMap:
+                      name: ${SERVICE}-migrations
+          EOF
+
+          echo "Waiting for migration job: $JOB_NAME"
+
+          # Wait for completion
+          if kubectl wait --for=condition=complete job/"$JOB_NAME" -n "$NAMESPACE" --timeout=300s 2>/dev/null; then
+            POD_NAME=$(kubectl get pods -n "$NAMESPACE" -l job-name="$JOB_NAME" -o jsonpath='{.items[0].metadata.name}')
+            echo '```' >> $GITHUB_STEP_SUMMARY
+            kubectl logs "$POD_NAME" -n "$NAMESPACE" >> $GITHUB_STEP_SUMMARY
+            echo '```' >> $GITHUB_STEP_SUMMARY
+            echo "- PostgreSQL migrations completed successfully" >> $GITHUB_STEP_SUMMARY
+          else
+            POD_NAME=$(kubectl get pods -n "$NAMESPACE" -l job-name="$JOB_NAME" -o jsonpath='{.items[0].metadata.name}')
+            echo "::error::PostgreSQL migration failed"
+            kubectl logs "$POD_NAME" -n "$NAMESPACE" || true
+            exit 1
+          fi
+
       - name: Substitute secrets in manifests
         run: |
           OVERLAY_PATH="${{ inputs.service-path }}/k8s/overlays/${{ inputs.environment }}"
@@ -137,6 +319,7 @@ jobs:
           JWT_SECRET: ${{ secrets.JWT_SECRET }}
 
       - name: Update image in Kustomize
+        id: image
         run: |
           OVERLAY_PATH="${{ inputs.service-path }}/k8s/overlays/${{ inputs.environment }}"
 
@@ -153,11 +336,15 @@ jobs:
           # Container registries require lowercase names
           OWNER=$(echo "${{ github.repository_owner }}" | tr '[:upper:]' '[:lower:]')
 
+          # Use the tag determined in the previous step
+          IMAGE_TAG="${{ steps.image-tag.outputs.tag }}"
+
           # Update the image reference
           IMAGE="${{ inputs.registry }}/${OWNER}/${SERVICE_TYPE}/${{ inputs.service }}"
-          kustomize edit set image "${{ inputs.service }}=${IMAGE}:${{ inputs.image-tag }}"
+          kustomize edit set image "${{ inputs.service }}=${IMAGE}:${IMAGE_TAG}"
 
-          echo "Updated image to: ${IMAGE}:${{ inputs.image-tag }}"
+          echo "tag=${IMAGE_TAG}" >> $GITHUB_OUTPUT
+          echo "Updated image to: ${IMAGE}:${IMAGE_TAG}"
 
       - name: Build manifests
         id: kustomize
@@ -184,7 +371,10 @@ jobs:
           echo "### Applied Manifests" >> $GITHUB_STEP_SUMMARY
           echo "- Environment: ${{ inputs.environment }}" >> $GITHUB_STEP_SUMMARY
           echo "- Service: ${{ inputs.service }}" >> $GITHUB_STEP_SUMMARY
-          echo "- Image: ${{ inputs.image-tag }}" >> $GITHUB_STEP_SUMMARY
+          echo "- Image tag: ${{ steps.image.outputs.tag }}" >> $GITHUB_STEP_SUMMARY
+          if [[ "${{ inputs.keep-existing-image }}" == "true" ]]; then
+            echo "- Image source: kept existing (k8s config only change)" >> $GITHUB_STEP_SUMMARY
+          fi
 
       - name: Wait for rollout
         run: |

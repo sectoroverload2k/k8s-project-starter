@@ -11,6 +11,15 @@ outputs:
   matrix:
     description: 'JSON matrix of changed services with deployment config'
     value: ${{ steps.set-matrix.outputs.matrix }}
+  kubernetes_matrix:
+    description: 'JSON matrix of Kubernetes deployments only'
+    value: ${{ steps.set-matrix.outputs.kubernetes_matrix }}
+  server_matrix:
+    description: 'JSON matrix of server deployments only'
+    value: ${{ steps.set-matrix.outputs.server_matrix }}
+  migrations_matrix:
+    description: 'JSON matrix of migration deployments only'
+    value: ${{ steps.set-matrix.outputs.migrations_matrix }}
   has_changes:
     description: 'Whether any services have changes'
     value: ${{ steps.set-matrix.outputs.has_changes }}
@@ -30,34 +39,14 @@ outputs:
 runs:
   using: 'composite'
   steps:
-    - name: Detect changed files
-      id: changes
-      uses: dorny/paths-filter@v3
+    - name: Setup Python for YAML parsing
+      uses: actions/setup-python@v5
       with:
-        token: ${{ github.token }}
-        filters: |
-          # Apps
-          dashboard:
-            - 'apps/dashboard/**'
-          landing:
-            - 'apps/landing/**'
-          frontend:
-            - 'apps/frontend/**'
-          # Services
-          api:
-            - 'services/api/**'
-          auth:
-            - 'services/auth/**'
-          # Infrastructure
-          mysql:
-            - 'infra/mysql/**'
-          redis:
-            - 'infra/redis/**'
-          # Shared changes trigger rebuild of all
-          shared:
-            - 'infra/shared/**'
-            - '.github/workflows/_*.yml'
-            - 'platform/platform.yaml'
+        python-version: '3.11'
+
+    - name: Install PyYAML
+      shell: bash
+      run: pip install pyyaml
 
     - name: Build matrix with deployment config
       id: set-matrix
@@ -68,23 +57,85 @@ runs:
         # Initialize arrays
         declare -a services=()
         declare -a matrix_items=()
+        declare -a kubernetes_items=()
+        declare -a server_items=()
+        declare -a migrations_items=()
         HAS_KUBERNETES=false
         HAS_SERVER=false
         HAS_MIGRATIONS=false
 
-        # Function to read deploy config
+        # Get changed files compared to previous commit
+        if git rev-parse HEAD~1 >/dev/null 2>&1; then
+          CHANGED_FILES=$(git diff --name-only HEAD~1 HEAD)
+        else
+          # First commit - consider all files as changed
+          CHANGED_FILES=$(git ls-tree -r HEAD --name-only)
+        fi
+
+        # Check if shared infrastructure changed (triggers rebuild of all)
+        SHARED_CHANGED=false
+        if echo "$CHANGED_FILES" | grep -qE "^(infra/shared/|\.github/workflows/_.*\.yml|platform/platform\.yaml)"; then
+          SHARED_CHANGED=true
+        fi
+
+        # Extract unique component directories from changed files
+        # Looks for: apps/<name>/, services/<name>/, infra/<name>/
+        CHANGED_COMPONENTS=$(echo "$CHANGED_FILES" | grep -oE "^(apps|services|infra)/[^/]+" | sort -u || true)
+
+        # If shared changed, find ALL components with deploy.yaml
+        if [[ "$SHARED_CHANGED" == "true" ]]; then
+          ALL_COMPONENTS=""
+          for dir in apps services infra; do
+            if [[ -d "$dir" ]]; then
+              for component_path in "$dir"/*/; do
+                if [[ -d "$component_path" ]]; then
+                  component_path="${component_path%/}"  # Remove trailing slash
+                  # Skip shared infra (it's not a deployable component)
+                  if [[ "$component_path" == "infra/shared" ]]; then
+                    continue
+                  fi
+                  ALL_COMPONENTS="$ALL_COMPONENTS"$'\n'"$component_path"
+                fi
+              done
+            fi
+          done
+          CHANGED_COMPONENTS=$(echo "$ALL_COMPONENTS" | grep -v "^$" | sort -u)
+        fi
+
+        # Function to read deploy config (supports per-environment types)
         get_deploy_config() {
           local path=$1
           local env=$ENVIRONMENT
 
-          # Check for deploy.yaml (not .example)
           if [[ -f "${path}/deploy.yaml" ]]; then
-            local deploy_type=$(grep -E "^type:" "${path}/deploy.yaml" | head -1 | awk '{print $2}' | tr -d '"'"'" || echo "kubernetes")
-            local method=$(grep -E "^method:" "${path}/deploy.yaml" | head -1 | awk '{print $2}' | tr -d '"'"'" || echo "")
+            # Use Python to properly parse YAML and check per-env config first
+            python3 -c "
+        import yaml
+        try:
+            with open('${path}/deploy.yaml') as f:
+                config = yaml.safe_load(f)
 
-            echo "$deploy_type|$method"
+            targets = config.get('targets', {})
+
+            # If targets are defined, the environment MUST exist to be deployed
+            if targets:
+                target = targets.get('${env}')
+                if target is None:
+                    # Environment not defined in targets - skip this service
+                    print('skip|')
+                else:
+                    deploy_type = target.get('type', 'kubernetes')
+                    method = target.get('method', '')
+                    print(f'{deploy_type}|{method}')
+            else:
+                # No targets defined - use top-level type (legacy format)
+                deploy_type = config.get('type', 'kubernetes')
+                method = config.get('method', '')
+                print(f'{deploy_type}|{method}')
+        except:
+            print('kubernetes|')
+        " 2>/dev/null || echo "kubernetes|"
           else
-            # Default to kubernetes if no deploy.yaml
             echo "kubernetes|"
           fi
         }
@@ -95,107 +146,233 @@ runs:
           local env=$ENVIRONMENT
 
           if [[ -f "${path}/deploy.yaml" ]]; then
-            # Extract hosts array for environment
-            local hosts=$(python3 -c "
+            python3 -c "
         import yaml
         import json
         try:
             with open('${path}/deploy.yaml') as f:
                 config = yaml.safe_load(f)
-            targets = config.get('targets', {}).get('${env}', {})
-            hosts = targets.get('hosts', [])
-            print(json.dumps(hosts))
+            target = config.get('targets', {}).get('${env}', {})
+            hosts = target.get('hosts', [])
+            deploy_path = target.get('path', '/var/www/app')
+            print(json.dumps(hosts) + '|' + deploy_path)
         except:
-            print('[]')
-        " 2>/dev/null || echo "[]")
-
-            local deploy_path=$(python3 -c "
-        import yaml
-        try:
-            with open('${path}/deploy.yaml') as f:
-                config = yaml.safe_load(f)
-            targets = config.get('targets', {}).get('${env}', {})
-            print(targets.get('path', '/var/www/app'))
-        except:
-            print('/var/www/app')
-        " 2>/dev/null || echo "/var/www/app")
-
-            echo "${hosts}|${deploy_path}"
+            print('[]|/var/www/app')
+        " 2>/dev/null || echo "[]|/var/www/app"
           else
             echo "[]|/var/www/app"
           fi
         }
 
-        # Check each component for changes
-        declare -A COMPONENTS=(
-          ["dashboard"]="apps/dashboard|app"
-          ["landing"]="apps/landing|app"
-          ["frontend"]="apps/frontend|app"
-          ["api"]="services/api|service"
-          ["auth"]="services/auth|service"
-          ["mysql"]="infra/mysql|infra"
-          ["redis"]="infra/redis|infra"
-        )
+        # Function to get runner config
+        get_runner_config() {
+          local path=$1
+          local env=$ENVIRONMENT
+          local deploy_type=$2
 
-        for component in "${!COMPONENTS[@]}"; do
-          IFS='|' read -r path comp_type <<< "${COMPONENTS[$component]}"
+          if [[ -f "${path}/deploy.yaml" ]]; then
+            python3 -c "
+        import yaml
+        import json
+        try:
+            with open('${path}/deploy.yaml') as f:
+                config = yaml.safe_load(f)
+            target = config.get('targets', {}).get('${env}', {})
+            runner = target.get('runner', '')
 
-          # Check if this component changed
-          changed_var="steps.changes.outputs.${component}"
-          is_changed="${{ steps.changes.outputs.dashboard }}"  # Will be overwritten below
+            # Default runner based on deploy type
+            if not runner:
+                if '${deploy_type}' == 'kubernetes':
+                    runner = 'ubuntu-latest'
+                else:
+                    runner = 'ubuntu-latest'  # Can be overridden in deploy.yaml
 
-          # Use indirect reference for the change status
-          case "$component" in
-            dashboard) is_changed="${{ steps.changes.outputs.dashboard }}" ;;
-            landing) is_changed="${{ steps.changes.outputs.landing }}" ;;
-            frontend) is_changed="${{ steps.changes.outputs.frontend }}" ;;
-            api) is_changed="${{ steps.changes.outputs.api }}" ;;
-            auth) is_changed="${{ steps.changes.outputs.auth }}" ;;
-            mysql) is_changed="${{ steps.changes.outputs.mysql }}" ;;
-            redis) is_changed="${{ steps.changes.outputs.redis }}" ;;
-          esac
+            # Output as JSON (handles both string and array)
+            print(json.dumps(runner))
+        except:
+            print('\"ubuntu-latest\"')
+        " 2>/dev/null || echo '"ubuntu-latest"'
+          else
+            echo '"ubuntu-latest"'
+          fi
+        }
 
-          shared_changed="${{ steps.changes.outputs.shared }}"
+        # Function to get build config
+        get_build_config() {
+          local path=$1
+          local deploy_type=$2
 
-          if [[ "$is_changed" == "true" ]] || [[ "$shared_changed" == "true" ]]; then
-            # Check if component exists (has VERSION, package.json, or deploy.yaml)
-            if [[ -f "${path}/VERSION" ]] || [[ -f "${path}/package.json" ]] || [[ -f "${path}/deploy.yaml" ]]; then
+          if [[ -f "${path}/deploy.yaml" ]]; then
+            python3 -c "
+        import yaml
+        try:
+            with open('${path}/deploy.yaml') as f:
+                config = yaml.safe_load(f)
 
-              # Get deployment configuration
-              IFS='|' read -r deploy_type method <<< "$(get_deploy_config "$path")"
+            build = config.get('build', {})
+            build_type = build.get('type', '')
+            build_cmd = build.get('command', '')
+            build_output = build.get('output', '')
+            build_context = build.get('context', '')  # For shared packages
 
-              services+=("$component")
+            # Default build type based on deploy type if not specified
+            if not build_type:
+                if '${deploy_type}' == 'kubernetes':
+                    build_type = 'docker'
+                else:
+                    build_type = 'none'
 
-              case "$deploy_type" in
-                kubernetes)
-                  HAS_KUBERNETES=true
-                  matrix_items+=("{\"service\":\"${component}\",\"path\":\"${path}\",\"type\":\"${comp_type}\",\"deploy_type\":\"kubernetes\"}")
-                  ;;
-                server)
-                  HAS_SERVER=true
-                  IFS='|' read -r hosts deploy_path <<< "$(get_server_config "$path")"
-                  matrix_items+=("{\"service\":\"${component}\",\"path\":\"${path}\",\"type\":\"${comp_type}\",\"deploy_type\":\"server\",\"method\":\"${method:-rsync}\",\"hosts\":${hosts},\"deploy_path\":\"${deploy_path}\"}")
-                  ;;
-                migration)
-                  HAS_MIGRATIONS=true
-                  matrix_items+=("{\"service\":\"${component}\",\"path\":\"${path}\",\"type\":\"${comp_type}\",\"deploy_type\":\"migration\"}")
-                  ;;
-                static)
-                  matrix_items+=("{\"service\":\"${component}\",\"path\":\"${path}\",\"type\":\"${comp_type}\",\"deploy_type\":\"static\"}")
-                  ;;
-                *)
-                  # Default to kubernetes
-                  HAS_KUBERNETES=true
-                  matrix_items+=("{\"service\":\"${component}\",\"path\":\"${path}\",\"type\":\"${comp_type}\",\"deploy_type\":\"kubernetes\"}")
-                  ;;
-              esac
+            # Default output directories by build type
+            if not build_output:
+                defaults = {'npm': 'dist', 'yarn': 'dist', 'hugo': 'public', 'docker': '', 'none': '', 'zip': ''}
+                build_output = defaults.get(build_type, '')
+
+            print(f'{build_type}|{build_cmd}|{build_output}|{build_context}')
+        except:
+            if '${deploy_type}' == 'kubernetes':
+                print('docker|||')
+            else:
+                print('none|||')
+        " 2>/dev/null || echo "none|||"
+          else
+            if [[ "$deploy_type" == "kubernetes" ]]; then
+              echo "docker|||"
+            else
+              echo "none|||"
             fi
           fi
-        done
+        }
 
-        # Build JSON matrix
+        # Function to get database config (for pg_migrations flag)
+        get_database_config() {
+          local path=$1
+
+          if [[ -f "${path}/deploy.yaml" ]]; then
+            python3 -c "
+        import yaml
+        try:
+            with open('${path}/deploy.yaml') as f:
+                config = yaml.safe_load(f)
+
+            database = config.get('database', {})
+            db_type = database.get('type', '')
+            migrations = database.get('migrations', False)
+
+            # Return pg_migrations flag if postgresql with migrations enabled
+            if db_type == 'postgresql' and migrations:
+                print('true')
+            else:
+                print('false')
+        except:
+            print('false')
+        " 2>/dev/null || echo "false"
+          else
+            echo "false"
+          fi
+        }
+
+        # Function to check if code (non-k8s) files changed for a component
+        check_needs_build() {
+          local component_path=$1
+
+          # Check if any changed files are outside the k8s/ directory
+          local code_changes=$(echo "$CHANGED_FILES" | grep "^${component_path}/" | grep -v "^${component_path}/k8s/" || true)
+
+          if [[ -n "$code_changes" ]]; then
+            echo "true"
+          else
+            echo "false"
+          fi
+        }
+
+        # Process each changed component
+        while IFS= read -r component_path; do
+          [[ -z "$component_path" ]] && continue
+
+          # Extract component name and type from path
+          comp_type=$(echo "$component_path" | cut -d'/' -f1)
+          component=$(echo "$component_path" | cut -d'/' -f2)
+
+          # Map directory type to component type
+          case "$comp_type" in
+            apps) comp_type="app" ;;
+            services) comp_type="service" ;;
+            infra) comp_type="infra" ;;
+          esac
+
+          # Check if component is deployable (has VERSION, package.json, or deploy.yaml)
+          if [[ -f "${component_path}/VERSION" ]] || [[ -f "${component_path}/package.json" ]] || [[ -f "${component_path}/deploy.yaml" ]]; then
+
+            # Check if we need to rebuild (code changed) or just redeploy (k8s only)
+            NEEDS_BUILD=$(check_needs_build "$component_path")
+
+            # If shared infra changed, force rebuild
+            if [[ "$SHARED_CHANGED" == "true" ]]; then
+              NEEDS_BUILD="true"
+            fi
+
+            # Get deployment configuration
+            IFS='|' read -r deploy_type method <<< "$(get_deploy_config "$component_path")"
+
+            # Skip if this environment is not defined for this service
+            if [[ "$deploy_type" == "skip" ]]; then
+              echo "Skipping $component - no $ENVIRONMENT target defined"
+              continue
+            fi
+
+            # Get build configuration
+            IFS='|' read -r build_type build_cmd build_output build_context <<< "$(get_build_config "$component_path" "$deploy_type")"
+
+            # Get runner configuration
+            runner_json=$(get_runner_config "$component_path" "$deploy_type")
+
+            # Get database configuration
+            pg_migrations=$(get_database_config "$component_path")
+
+            services+=("$component")
+
+            # Base JSON for all types
+            base_json="\"service\":\"${component}\",\"path\":\"${component_path}\",\"type\":\"${comp_type}\",\"build_type\":\"${build_type}\",\"runner\":${runner_json},\"needs_build\":${NEEDS_BUILD},\"pg_migrations\":${pg_migrations}"
+            [[ -n "$build_cmd" ]] && base_json="${base_json},\"build_cmd\":\"${build_cmd}\""
+            [[ -n "$build_output" ]] && base_json="${base_json},\"build_output\":\"${build_output}\""
+            [[ -n "$build_context" ]] && base_json="${base_json},\"build_context\":\"${build_context}\""
+
+            case "$deploy_type" in
+              kubernetes)
+                HAS_KUBERNETES=true
+                item="{${base_json},\"deploy_type\":\"kubernetes\"}"
+                matrix_items+=("$item")
+                kubernetes_items+=("$item")
+                ;;
+              server)
+                HAS_SERVER=true
+                IFS='|' read -r hosts deploy_path <<< "$(get_server_config "$component_path")"
+                item="{${base_json},\"deploy_type\":\"server\",\"method\":\"${method:-rsync}\",\"hosts\":${hosts},\"deploy_path\":\"${deploy_path}\"}"
+                matrix_items+=("$item")
+                server_items+=("$item")
+                ;;
+              migration)
+                HAS_MIGRATIONS=true
+                item="{${base_json},\"deploy_type\":\"migration\"}"
+                matrix_items+=("$item")
+                migrations_items+=("$item")
+                ;;
+              static)
+                matrix_items+=("{${base_json},\"deploy_type\":\"static\"}")
+                ;;
+              *)
+                HAS_KUBERNETES=true
+                item="{${base_json},\"deploy_type\":\"kubernetes\"}"
+                matrix_items+=("$item")
+                kubernetes_items+=("$item")
+                ;;
+            esac
+          fi
+        done <<< "$CHANGED_COMPONENTS"
+
+        # Build JSON matrices
         if [[ ${#matrix_items[@]} -gt 0 ]]; then
-          matrix_json=$(printf '%s\n' "${matrix_items[@]}" | jq -s '{"include": .}')
+          matrix_json=$(printf '%s\n' "${matrix_items[@]}" | jq -sc '{"include": .}')
           echo "matrix=$matrix_json" >> $GITHUB_OUTPUT
           echo "has_changes=true" >> $GITHUB_OUTPUT
           echo "changed_services=${services[*]}" >> $GITHUB_OUTPUT
@@ -205,20 +382,47 @@ runs:
           echo "changed_services=" >> $GITHUB_OUTPUT
         fi
 
+        # Build type-specific matrices
+        if [[ ${#kubernetes_items[@]} -gt 0 ]]; then
+          k8s_json=$(printf '%s\n' "${kubernetes_items[@]}" | jq -sc '{"include": .}')
+          echo "kubernetes_matrix=$k8s_json" >> $GITHUB_OUTPUT
+        else
+          echo 'kubernetes_matrix={"include":[]}' >> $GITHUB_OUTPUT
+        fi
+
+        if [[ ${#server_items[@]} -gt 0 ]]; then
+          server_json=$(printf '%s\n' "${server_items[@]}" | jq -sc '{"include": .}')
+          echo "server_matrix=$server_json" >> $GITHUB_OUTPUT
+        else
+          echo 'server_matrix={"include":[]}' >> $GITHUB_OUTPUT
+        fi
+
+        if [[ ${#migrations_items[@]} -gt 0 ]]; then
+          migrations_json=$(printf '%s\n' "${migrations_items[@]}" | jq -sc '{"include": .}')
+          echo "migrations_matrix=$migrations_json" >> $GITHUB_OUTPUT
+        else
+          echo 'migrations_matrix={"include":[]}' >> $GITHUB_OUTPUT
+        fi
+
         echo "has_kubernetes=$HAS_KUBERNETES" >> $GITHUB_OUTPUT
         echo "has_server=$HAS_SERVER" >> $GITHUB_OUTPUT
         echo "has_migrations=$HAS_MIGRATIONS" >> $GITHUB_OUTPUT
 
         # Log detected changes
         echo "### Detected Changes" >> $GITHUB_STEP_SUMMARY
+        echo "**Environment:** $ENVIRONMENT" >> $GITHUB_STEP_SUMMARY
+        echo "**Shared changed:** $SHARED_CHANGED" >> $GITHUB_STEP_SUMMARY
+        echo "" >> $GITHUB_STEP_SUMMARY
         if [[ ${#services[@]} -gt 0 ]]; then
-          echo "| Service | Path | Deploy Type |" >> $GITHUB_STEP_SUMMARY
-          echo "|---------|------|-------------|" >> $GITHUB_STEP_SUMMARY
+          echo "| Service | Path | Build | Deploy | Needs Build |" >> $GITHUB_STEP_SUMMARY
+          echo "|---------|------|-------|--------|-------------|" >> $GITHUB_STEP_SUMMARY
           for item in "${matrix_items[@]}"; do
             svc=$(echo "$item" | jq -r '.service')
             path=$(echo "$item" | jq -r '.path')
+            btype=$(echo "$item" | jq -r '.build_type')
             dtype=$(echo "$item" | jq -r '.deploy_type')
-            echo "| $svc | $path | $dtype |" >> $GITHUB_STEP_SUMMARY
+            nbuild=$(echo "$item" | jq -r '.needs_build')
+            echo "| $svc | $path | $btype | $dtype | $nbuild |" >> $GITHUB_STEP_SUMMARY
           done
         else
           echo "No service changes detected" >> $GITHUB_STEP_SUMMARY

@@ -21,6 +21,11 @@ on:
         type: string
         default: ''
         description: 'Build output directory (for npm, yarn, hugo builds)'
+      build-context:
+        required: false
+        type: string
+        default: ''
+        description: 'Docker build context (default: service-path, use "." for repo root when using shared packages)'
       version-suffix:
         required: false
         type: string
@@ -36,9 +41,14 @@ on:
         type: boolean
         default: true
         description: 'Push image to registry (Docker only)'
+      skip-build:
+        required: false
+        type: boolean
+        default: false
+        description: 'Skip build (only calculate version for deploy-only changes)'
     outputs:
       version:
-        description: 'Full version string'
+        description: 'Full version string (new version if built, or last existing version if skipped)'
         value: ${{ jobs.build.outputs.version }}
       image:
         description: 'Full image name with tag (Docker only)'
@@ -49,6 +59,9 @@ on:
       artifact-name:
         description: 'Build artifact name (non-Docker builds)'
         value: ${{ jobs.build.outputs.artifact-name }}
+      keep-existing-image:
+        description: 'True if deploy should use the currently running image (k8s-only changes)'
+        value: ${{ jobs.build.outputs.keep-existing-image }}
 
 jobs:
   build:
@@ -57,6 +70,7 @@ jobs:
       version: ${{ steps.version.outputs.version }}
       artifact-name: ${{ steps.artifact.outputs.name }}
       skip-docker: ${{ steps.check-type.outputs.skip-docker }}
+      keep-existing-image: ${{ inputs.skip-build }}
 
     steps:
       - name: Checkout
@@ -105,21 +119,28 @@ jobs:
           echo "- Base version: ${BASE_VERSION}" >> $GITHUB_STEP_SUMMARY
           echo "- Full version: ${FULL_VERSION}" >> $GITHUB_STEP_SUMMARY
 
+      # === Skip build (deploy-only changes) ===
+      - name: Skip build (deploy-only)
+        if: inputs.skip-build
+        run: |
+          echo "Skipping build - only k8s/deploy changes detected" >> $GITHUB_STEP_SUMMARY
+          echo "Deploy will use the currently running image" >> $GITHUB_STEP_SUMMARY
+
       # === None: No build needed ===
       - name: Skip build (none)
-        if: inputs.build-type == 'none'
+        if: inputs.build-type == 'none' && !inputs.skip-build
         run: |
           echo "No build needed for this service" >> $GITHUB_STEP_SUMMARY
 
       # === NPM Build ===
       - name: Setup Node.js
-        if: inputs.build-type == 'npm' || inputs.build-type == 'yarn'
+        if: (inputs.build-type == 'npm' || inputs.build-type == 'yarn') && !inputs.skip-build
         uses: actions/setup-node@v4
         with:
           node-version: '20'
 
       - name: NPM Build
-        if: inputs.build-type == 'npm'
+        if: inputs.build-type == 'npm' && !inputs.skip-build
         working-directory: ${{ inputs.service-path }}
         run: |
           npm ci
@@ -128,7 +149,7 @@ jobs:
 
       # === Yarn Build ===
       - name: Yarn Build
-        if: inputs.build-type == 'yarn'
+        if: inputs.build-type == 'yarn' && !inputs.skip-build
         working-directory: ${{ inputs.service-path }}
         run: |
           yarn install --frozen-lockfile
@@ -137,14 +158,14 @@ jobs:
 
       # === Hugo Build ===
       - name: Setup Hugo
-        if: inputs.build-type == 'hugo'
+        if: inputs.build-type == 'hugo' && !inputs.skip-build
         uses: peaceiris/actions-hugo@v3
         with:
           hugo-version: 'latest'
           extended: true
 
       - name: Hugo Build
-        if: inputs.build-type == 'hugo'
+        if: inputs.build-type == 'hugo' && !inputs.skip-build
         working-directory: ${{ inputs.service-path }}
         run: |
           hugo --minify
@@ -152,7 +173,7 @@ jobs:
 
       # === Zip Build ===
       - name: Create zip archive
-        if: inputs.build-type == 'zip'
+        if: inputs.build-type == 'zip' && !inputs.skip-build
         run: |
           cd ${{ inputs.service-path }}
           zip -r ../build-${{ inputs.service }}-${{ steps.version.outputs.version }}.zip .
@@ -161,7 +182,7 @@ jobs:
       # === Upload artifact for non-Docker builds ===
       - name: Determine artifact path
         id: artifact
-        if: inputs.build-type != 'docker' && inputs.build-type != 'none'
+        if: inputs.build-type != 'docker' && inputs.build-type != 'none' && !inputs.skip-build
         run: |
           SERVICE_PATH="${{ inputs.service-path }}"
           BUILD_TYPE="${{ inputs.build-type }}"
@@ -185,7 +206,7 @@ jobs:
           echo "name=$ARTIFACT_NAME" >> $GITHUB_OUTPUT
 
       - name: Upload build artifact
-        if: inputs.build-type != 'docker' && inputs.build-type != 'none'
+        if: inputs.build-type != 'docker' && inputs.build-type != 'none' && !inputs.skip-build
         uses: actions/upload-artifact@v4
         with:
           name: ${{ steps.artifact.outputs.name }}
@@ -195,7 +216,7 @@ jobs:
   # Docker build runs as separate job to allow conditional execution
   build-docker:
     needs: build
-    if: inputs.build-type == 'docker'
+    if: inputs.build-type == 'docker' && !inputs.skip-build
     runs-on: ubuntu-latest
     outputs:
       image: ${{ steps.meta.outputs.tags }}
@@ -244,7 +265,8 @@ jobs:
         id: build-push
         uses: docker/build-push-action@v5
         with:
-          context: ${{ inputs.service-path }}
+          context: ${{ inputs.build-context != '' && inputs.build-context || inputs.service-path }}
+          file: ${{ inputs.service-path }}/Dockerfile
           push: ${{ inputs.push }}
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}

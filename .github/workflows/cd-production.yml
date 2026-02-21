@@ -58,8 +58,10 @@ jobs:
       service-path: ${{ matrix.path }}
       build-type: ${{ matrix.build_type }}
       build-output: ${{ matrix.build_output || '' }}
+      build-context: ${{ matrix.build_context || '' }}
       version-suffix: ''  # Production: no suffix
-      push: ${{ matrix.deploy_type == 'kubernetes' }}
+      push: ${{ matrix.deploy_type == 'kubernetes' && matrix.needs_build }}
+      skip-build: ${{ !matrix.needs_build }}
     secrets: inherit
 
   # Deploy to Kubernetes (with manual approval via environment)
@@ -77,7 +79,9 @@ jobs:
       service-path: ${{ matrix.path }}
       environment: prod
       image-tag: ${{ needs.build.outputs.version }}
+      keep-existing-image: ${{ needs.build.outputs.keep-existing-image == 'true' }}
       run-migrations: ${{ matrix.type == 'service' }}
+      run-pg-migrations: ${{ matrix.pg_migrations == true }}
       runner: ${{ toJson(matrix.runner) }}
     secrets:
       KUBECONFIG: ${{ secrets.PROD_KUBECONFIG }}
