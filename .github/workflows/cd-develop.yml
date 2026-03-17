@@ -84,6 +84,7 @@ jobs:
       keep-existing-image: ${{ needs.build.outputs.keep-existing-image == 'true' }}
       run-mysql-migrations: ${{ matrix.mysql_migrations == true }}
       run-pg-migrations: ${{ matrix.pg_migrations == true }}
+      skip-rollout-wait: ${{ matrix.skip_rollout_wait == true }}
       runner: ${{ toJson(matrix.runner) }}
     secrets:
       KUBECONFIG: ${{ secrets.DEV_KUBECONFIG }}

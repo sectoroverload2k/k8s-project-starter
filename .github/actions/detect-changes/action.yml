@@ -278,6 +278,28 @@ runs:
           fi
         }
 
+        # Function to get skip_rollout_wait flag
+        get_skip_rollout_wait() {
+          local path=$1
+          local env=$ENVIRONMENT
+
+          if [[ -f "${path}/deploy.yaml" ]]; then
+            python3 -c "
+        import yaml
+        try:
+            with open('${path}/deploy.yaml') as f:
+                config = yaml.safe_load(f)
+            target = config.get('targets', {}).get('${env}', {})
+            skip_rollout = target.get('skip_rollout_wait', False)
+            print('true' if skip_rollout else 'false')
+        except:
+            print('false')
+        " 2>/dev/null || echo "false"
+          else
+            echo "false"
+          fi
+        }
+
         # Function to check if code (non-k8s) files changed for a component
         check_needs_build() {
           local component_path=$1
@@ -337,10 +359,13 @@ runs:
             # Get database configuration
             IFS='|' read -r pg_migrations mysql_migrations <<< "$(get_database_config "$component_path")"
 
+            # Get skip_rollout_wait flag
+            skip_rollout_wait=$(get_skip_rollout_wait "$component_path")
+
             services+=("$component")
 
             # Base JSON for all types
-            base_json="\"service\":\"${component}\",\"path\":\"${component_path}\",\"type\":\"${comp_type}\",\"build_type\":\"${build_type}\",\"runner\":${runner_json},\"needs_build\":${NEEDS_BUILD},\"pg_migrations\":${pg_migrations},\"mysql_migrations\":${mysql_migrations}"
+            base_json="\"service\":\"${component}\",\"path\":\"${component_path}\",\"type\":\"${comp_type}\",\"build_type\":\"${build_type}\",\"runner\":${runner_json},\"needs_build\":${NEEDS_BUILD},\"pg_migrations\":${pg_migrations},\"mysql_migrations\":${mysql_migrations},\"skip_rollout_wait\":${skip_rollout_wait}"
             [[ -n "$build_cmd" ]] && base_json="${base_json},\"build_cmd\":\"${build_cmd}\""
             [[ -n "$build_output" ]] && base_json="${base_json},\"build_output\":\"${build_output}\""
             [[ -n "$build_context" ]] && base_json="${base_json},\"build_context\":\"${build_context}\""

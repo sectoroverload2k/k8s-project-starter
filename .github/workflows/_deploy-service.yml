@@ -40,6 +40,11 @@ on:
         type: boolean
         default: false
         description: 'Run PostgreSQL migrations before deploy (service-level)'
+      skip-rollout-wait:
+        required: false
+        type: boolean
+        default: false
+        description: 'Skip rollout wait for resources without Deployment/StatefulSet (e.g., namespace)'
       runner:
         required: false
         type: string
@@ -250,6 +255,7 @@ jobs:
           fi
 
       - name: Detect resource type
+        if: inputs.skip-rollout-wait == false
         id: resource
         run: |
           NAMESPACE="${{ steps.kustomize.outputs.namespace }}"
@@ -280,6 +286,7 @@ jobs:
           exit 1
 
       - name: Wait for rollout
+        if: inputs.skip-rollout-wait == false
         run: |
           NAMESPACE="${{ steps.kustomize.outputs.namespace }}"
           RESOURCE="${{ inputs.service }}"
@@ -295,6 +302,7 @@ jobs:
           kubectl get "$TYPE" "$RESOURCE" -n "$NAMESPACE" -o wide >> $GITHUB_STEP_SUMMARY
 
       - name: Verify deployment
+        if: inputs.skip-rollout-wait == false
         run: |
           NAMESPACE="${{ steps.kustomize.outputs.namespace }}"
           RESOURCE="${{ inputs.service }}"
